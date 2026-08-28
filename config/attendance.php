@@ -52,4 +52,28 @@ return [
     */
     'warning_cooldown_days' => (int) env('ATTENDANCE_WARNING_COOLDOWN_DAYS', 7),
 
+        /*
+    |--------------------------------------------------------------------------
+    | QR Token Rotation (seconds)
+    |--------------------------------------------------------------------------
+    | How long one QR token stays valid. A short window means a screenshot
+    | is useless by the time it reaches someone outside the room.
+    |
+    | Set to 0 to disable rotation (the token then lasts the whole session).
+    */
+    'qr_rotate_seconds' => (int) env('ATTENDANCE_QR_ROTATE_SECONDS', 15),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Allowed Network Prefixes
+    |--------------------------------------------------------------------------
+    | When set, a scan is only accepted from these IP prefixes -- normally
+    | the school Wi-Fi. Leave empty to accept scans from anywhere.
+    |
+    | Example: ATTENDANCE_ALLOWED_IPS=192.168.1.,192.168.2.,10.0.
+    */
+    'allowed_ip_prefixes' => array_filter(
+        explode(',', (string) env('ATTENDANCE_ALLOWED_IPS', ''))
+    ),
+
 ];

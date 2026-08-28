@@ -134,7 +134,7 @@ Route::middleware(['auth', 'role:instructor'])
         Route::get('/qr',                    [QRAttendanceController::class, 'index'])->name('qr.index');
         Route::get('/qr/{class}',            [QRAttendanceController::class, 'show'])->name('qr.show');
         Route::get('/qr/stats/{session}',    [QRAttendanceController::class, 'stats'])->name('qr.stats');
-
+        Route::get('/qr/refresh/{session}', [QRAttendanceController::class, 'refreshQr'])->name('qr.refresh');
                 // Reports
                 // Reports
         Route::get('/reports',            [ReportController::class, 'index'])->name('reports.index');

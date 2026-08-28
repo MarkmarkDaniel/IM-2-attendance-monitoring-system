@@ -9,9 +9,9 @@ use App\Models\Enrollment;
 use App\Models\Notification;
 use App\Models\Student;
 use Carbon\Carbon;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
-use App\Services\NotificationService;
 
 class AttendanceService
 {
@@ -21,6 +21,9 @@ class AttendanceService
 
     /**
      * Open a session for a class on a given date, or return the existing one.
+     * The UNIQUE (class_id, session_date) key means there can only ever be
+     * one session per class per day.
+     */
     public function openSession(ClassModel $class, ?string $date = null): AttendanceSession
     {
         $date = $date ?? now()->toDateString();
@@ -38,9 +41,43 @@ class AttendanceService
         // Old QR codes stop working immediately.
         $session->qr_token = $this->generateToken();
 
+        $seconds = (int) config('attendance.qr_rotate_seconds', 15);
+        $session->qr_token_expires_at = $seconds > 0
+            ? now()->addSeconds($seconds)
+            : null;
+
         $session->save();
 
         return $session;
+    }
+
+    /**
+     * Issue a fresh QR token if the current one has expired.
+     * The instructor's QR page polls this so the code on screen rotates.
+     */
+    public function rotateToken(AttendanceSession $session): AttendanceSession
+    {
+        $seconds = (int) config('attendance.qr_rotate_seconds', 15);
+
+        // Rotation disabled -- keep the token for the whole session
+        if ($seconds <= 0) {
+            return $session;
+        }
+
+        $stillValid = $session->qr_token
+            && $session->qr_token_expires_at
+            && $session->qr_token_expires_at->isFuture();
+
+        if ($stillValid) {
+            return $session;
+        }
+
+        $session->update([
+            'qr_token'            => $this->generateToken(),
+            'qr_token_expires_at' => now()->addSeconds($seconds),
+        ]);
+
+        return $session->refresh();
     }
 
     /**
@@ -58,9 +95,10 @@ class AttendanceService
             }
 
             $session->update([
-                'status'   => 'Closed',
-                'end_time' => now()->format('H:i:s'),
-                'qr_token' => null,   // the QR code is now dead
+                'status'              => 'Closed',
+                'end_time'            => now()->format('H:i:s'),
+                'qr_token'            => null,   // the QR code is now dead
+                'qr_token_expires_at' => null,
             ]);
         });
 
@@ -74,7 +112,7 @@ class AttendanceService
 
     /**
      * Create Absent records for enrolled students with no record yet.
-     * Never creates duplicates — the UNIQUE key on
+     * Never creates duplicates -- the UNIQUE key on
      * (class_id, student_id, attendance_date) is the final guard.
      */
     public function markAbsentees(AttendanceSession $session): int
@@ -162,7 +200,7 @@ class AttendanceService
             ]
         );
 
-          $this->notifyStudent($attendance);
+        $this->notifyStudent($attendance);
 
         // An absence may have pushed this student below the minimum
         if ($attendance->status === 'Absent') {
@@ -175,8 +213,6 @@ class AttendanceService
 
         return $attendance;
     }
-
-  
 
     /**
      * Tell the student what was recorded.
@@ -217,24 +253,10 @@ class AttendanceService
     }
 
     /**
-     * Secure random token for the QR code. Contains no personal data.
-     */
-    public function generateToken(): string
-    {
-        $length = (int) config('attendance.qr_token_length', 40);
-
-        do {
-            $token = Str::random($length);
-        } while (AttendanceSession::where('qr_token', $token)->exists());
-
-        return $token;
-    }
-
-    /**
      * Everything that can go wrong with a QR scan, in one place.
      * Returns ['ok' => bool, 'message' => string, 'attendance' => ?Attendance]
      */
-    public function processScan(string $token, Student $student): array
+    public function processScan(string $token, Student $student, ?Request $request = null): array
     {
         // 1. Does the token match an existing session?
         $session = AttendanceSession::with('classModel.subject')
@@ -242,7 +264,7 @@ class AttendanceService
             ->first();
 
         if (! $session) {
-            return $this->scanFail('Invalid or expired QR code. Ask your instructor for the current code.');
+            return $this->scanFail('Invalid or expired QR code. Point your camera at the code currently on screen.');
         }
 
         // 2. Is the session still accepting check-ins?
@@ -250,9 +272,42 @@ class AttendanceService
             return $this->scanFail('This attendance session has already been closed.');
         }
 
+        // 3. Has this particular token expired?
+        // A screenshot taken 30 seconds ago fails here.
+        $rotates = (int) config('attendance.qr_rotate_seconds', 15) > 0;
+
+        if ($rotates && $session->qr_token_expires_at && $session->qr_token_expires_at->isPast()) {
+            return $this->scanFail(
+                'This QR code has expired. It changes every '
+                . config('attendance.qr_rotate_seconds') . ' seconds -- scan the one on screen now.'
+            );
+        }
+
         $class = $session->classModel;
 
-        // 3. Is this student actually enrolled in the class?
+        // 4. Is the scan coming from an allowed network?
+        $allowed = config('attendance.allowed_ip_prefixes', []);
+        $ip      = $request?->ip();
+
+        if (! empty($allowed) && $ip) {
+            $onCampus = false;
+
+            foreach ($allowed as $prefix) {
+                if (str_starts_with($ip, trim($prefix))) {
+                    $onCampus = true;
+                    break;
+                }
+            }
+
+            if (! $onCampus) {
+                return $this->scanFail(
+                    'Attendance can only be recorded from the school network. '
+                    . 'Connect to the campus Wi-Fi and try again.'
+                );
+            }
+        }
+
+        // 5. Is this student actually enrolled in the class?
         $enrolled = Enrollment::where('class_id', $class->id)
             ->where('student_id', $student->id)
             ->where('enrollment_status', 'Enrolled')
@@ -262,7 +317,7 @@ class AttendanceService
             return $this->scanFail('You are not enrolled in ' . $class->subject->subject_code . '.');
         }
 
-        // 4. Has this student already checked in today?
+        // 6. Has this student already checked in today?
         $existing = Attendance::where('class_id', $class->id)
             ->where('student_id', $student->id)
             ->whereDate('attendance_date', $session->session_date->toDateString())
@@ -275,7 +330,7 @@ class AttendanceService
             );
         }
 
-        // 5. All checks passed — record the check-in
+        // 7. All checks passed -- record the check-in
         $now    = now();
         $timeIn = $now->format('H:i:s');
         $status = $class->determineStatus($now);
@@ -288,6 +343,14 @@ class AttendanceService
             remarks:    $status === 'Late' ? 'Arrived after class start time.' : null,
             recordedBy: null   // NULL means the student scanned it themselves
         );
+
+        // Audit trail -- lets you detect two students scanning from one phone
+        if ($request) {
+            $attendance->update([
+                'ip_address' => $request->ip(),
+                'user_agent' => substr((string) $request->userAgent(), 0, 255),
+            ]);
+        }
 
         $this->notifyInstructor($session, $student, $status);
 
@@ -330,5 +393,19 @@ class AttendanceService
             'message'    => $message,
             'attendance' => null,
         ];
+    }
+
+    /**
+     * Secure random token for the QR code. Contains no personal data.
+     */
+    public function generateToken(): string
+    {
+        $length = (int) config('attendance.qr_token_length', 40);
+
+        do {
+            $token = Str::random($length);
+        } while (AttendanceSession::where('qr_token', $token)->exists());
+
+        return $token;
     }
 }

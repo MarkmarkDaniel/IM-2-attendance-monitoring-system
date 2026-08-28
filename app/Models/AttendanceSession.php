@@ -11,9 +11,10 @@ class AttendanceSession extends Model
 {
     use HasFactory;
 
-    protected $fillable = [
+        protected $fillable = [
         'class_id',
         'qr_token',
+        'qr_token_expires_at',
         'session_date',
         'start_time',
         'end_time',
@@ -23,7 +24,8 @@ class AttendanceSession extends Model
     protected function casts(): array
     {
         return [
-            'session_date' => 'date',
+            'session_date'        => 'date',
+            'qr_token_expires_at' => 'datetime',
         ];
     }
 

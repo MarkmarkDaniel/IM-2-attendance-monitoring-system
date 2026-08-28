@@ -21,6 +21,8 @@ class Attendance extends Model
         'status',
         'remarks',
         'recorded_by',
+        'ip_address',
+        'user_agent',
     ];
 
     protected function casts(): array

@@ -46,24 +46,61 @@
             <div class="card-body text-center">
 
                 @if ($session->isOpen() && $scanUrl)
-                    <div class="d-inline-block p-3 bg-white border rounded mb-3">
+
+                    <div class="d-inline-block p-3 bg-white border rounded mb-3" id="qrHolder">
                         {!! QrCode::size(280)->margin(1)->errorCorrection('M')->generate($scanUrl) !!}
                     </div>
+
+                    {{-- ---------- Rotation countdown ---------- --}}
+                    @if (config('attendance.qr_rotate_seconds') > 0)
+                        <div class="mb-3">
+                            <div class="progress mx-auto" style="max-width: 280px; height: 6px;">
+                                <div class="progress-bar bg-success" id="qrTimer" style="width: 100%;"></div>
+                            </div>
+                            <p class="small text-muted mt-2 mb-0">
+                                <i class="bi bi-shield-lock me-1"></i>
+                                This code changes every
+                                <strong>{{ config('attendance.qr_rotate_seconds') }} seconds</strong>.
+                                A screenshot stops working almost immediately.
+                            </p>
+                        </div>
+                    @endif
 
                     <p class="small text-muted mb-1">
                         Students scan this with their phone camera or the in-app scanner.
                     </p>
-                    <p class="small text-muted mb-0">
+                    <p class="small text-muted mb-3">
                         The code contains only a random token &mdash; no personal information.
                     </p>
+
+                    {{-- ---------- Manual entry fallback ---------- --}}
+                    <div class="border-top pt-3">
+                        <label class="form-label small text-muted">
+                            Manual entry code (changes with the QR)
+                        </label>
+                        <div class="input-group input-group-sm">
+                            <input type="text" class="form-control font-monospace"
+                                   id="tokenField" value="{{ $session->qr_token }}" readonly>
+                            <button class="btn btn-outline-secondary" type="button" id="copyToken">
+                                <i class="bi bi-clipboard"></i>
+                            </button>
+                        </div>
+                        <div class="form-text">
+                            For students whose camera will not open in the browser.
+                        </div>
+                    </div>
+
                 @else
+
                     <div class="py-5">
                         <i class="bi bi-qr-code-scan fs-1 text-muted d-block mb-3"></i>
                         <p class="text-muted mb-3">
                             This session is closed. The QR code has expired and can no longer be scanned.
                         </p>
                         <form method="POST" action="{{ route('instructor.sessions.open', $class) }}"
-                              data-confirm="Reopen this session? A new QR token will be generated.">
+                              data-confirm="Reopen this session? A new QR token will be generated."
+                              data-confirm-title="Reopen Attendance Session"
+                              data-confirm-style="btn-secondary">
                             @csrf
                             <input type="hidden" name="session_date" value="{{ $date }}">
                             <button type="submit" class="btn btn-outline-secondary">
@@ -71,6 +108,7 @@
                             </button>
                         </form>
                     </div>
+
                 @endif
 
             </div>
@@ -99,19 +137,35 @@
                         </tr>
                         <tr>
                             <td class="ps-0 text-muted">Class Starts</td>
-                            <td>{{ \Carbon\Carbon::parse($class->start_time)->format('g:i A') }}
-                                <span class="text-muted">(+{{ config('attendance.late_grace_minutes') }} min grace)</span>
+                            <td>
+                                {{ \Carbon\Carbon::parse($class->start_time)->format('g:i A') }}
+                                <span class="text-muted">
+                                    (+{{ config('attendance.late_grace_minutes') }} min grace)
+                                </span>
                             </td>
                         </tr>
                         <tr>
                             <td class="ps-0 text-muted">Current Time</td>
                             <td><span id="liveClockQr" class="fw-medium"></span></td>
                         </tr>
+                        <tr>
+                            <td class="ps-0 text-muted">QR Security</td>
+                            <td>
+                                @if (config('attendance.qr_rotate_seconds') > 0)
+                                    <span class="badge bg-success">
+                                        Rotating every {{ config('attendance.qr_rotate_seconds') }}s
+                                    </span>
+                                @else
+                                    <span class="badge bg-secondary">Static token</span>
+                                @endif
+                            </td>
+                        </tr>
                     </tbody>
                 </table>
             </div>
         </div>
 
+        {{-- ---------- Live counters ---------- --}}
         <div class="row g-2 mb-3">
             <div class="col-6 col-md-3">
                 <div class="card stat-card h-100 text-center">
@@ -149,6 +203,7 @@
             </div>
         </div>
 
+        {{-- ---------- Recent check-ins ---------- --}}
         <div class="card">
             <div class="card-header bg-white d-flex justify-content-between align-items-center">
                 <span class="fw-medium">Recent Check-Ins</span>
@@ -172,7 +227,8 @@
         @if ($session->isOpen())
             <form method="POST" action="{{ route('instructor.sessions.close', $session) }}"
                   class="mt-3 no-print"
-                  data-confirm="Close this session? The QR code will stop working and every student without a record will be marked Absent.">
+                  data-confirm="Close this session? The QR code will stop working and every student without a record will be marked Absent."
+                  data-confirm-title="Close Attendance Session">
                 @csrf
                 <button type="submit" class="btn btn-danger w-100 py-2">
                     <i class="bi bi-stop-circle me-1"></i>Close Attendance Session
@@ -263,5 +319,85 @@
         setInterval(refreshStats, 5000);
     @endif
     @endif
+
+
+    // ---------- Rotating QR code ----------
+    @if ($session && $session->isOpen() && config('attendance.qr_rotate_seconds') > 0)
+    (function () {
+        const REFRESH_URL = '{{ route('instructor.qr.refresh', $session) }}';
+        const ROTATE_SECS = {{ (int) config('attendance.qr_rotate_seconds') }};
+
+        const holder  = document.getElementById('qrHolder');
+        const timer   = document.getElementById('qrTimer');
+        const tokenEl = document.getElementById('tokenField');
+
+        if (!holder) return;
+
+        let remaining = ROTATE_SECS;
+        let busy      = false;
+
+        async function refreshQr() {
+            if (busy) return;
+            busy = true;
+
+            try {
+                const response = await fetch(REFRESH_URL, {
+                    headers: { 'Accept': 'application/json' }
+                });
+
+                if (!response.ok) {
+                    // 410 means the session was closed from another tab
+                    if (response.status === 410) location.reload();
+                    return;
+                }
+
+                const data = await response.json();
+
+                if (!data.ok) return;
+
+                holder.innerHTML = data.svg;
+                if (tokenEl) tokenEl.value = data.token;
+
+                remaining = data.expires_in ?? ROTATE_SECS;
+
+            } catch (error) {
+                console.error('QR refresh failed:', error);
+            } finally {
+                busy = false;
+            }
+        }
+
+        // Countdown bar, ticking once per second
+        setInterval(function () {
+            remaining -= 1;
+
+            if (timer) {
+                const pct = Math.max(0, (remaining / ROTATE_SECS) * 100);
+                timer.style.width = pct + '%';
+                timer.className = 'progress-bar ' +
+                    (pct > 50 ? 'bg-success' : pct > 20 ? 'bg-warning' : 'bg-danger');
+            }
+
+            if (remaining <= 0) {
+                refreshQr();
+                remaining = ROTATE_SECS;
+            }
+        }, 1000);
+    })();
+    @endif
+
+
+    // ---------- Copy the manual entry token ----------
+    document.getElementById('copyToken')?.addEventListener('click', function () {
+        const field = document.getElementById('tokenField');
+        if (!field) return;
+
+        field.select();
+        field.setSelectionRange(0, 99999);
+        navigator.clipboard?.writeText(field.value);
+
+        this.innerHTML = '<i class="bi bi-check-lg"></i>';
+        setTimeout(() => { this.innerHTML = '<i class="bi bi-clipboard"></i>'; }, 1500);
+    });
 </script>
 @endpush
